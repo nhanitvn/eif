@@ -10,6 +10,7 @@ import numpy as np
 import random as rn
 import os
 import warnings
+from joblib import Parallel, delayed
 from version import __version__
 
 
@@ -59,7 +60,7 @@ class iForest(object):
     compute_paths(X_in)
         Computes the anomaly score for data X_in
     """
-    def __init__(self, X, ntrees,  sample_size, limit=None, ExtensionLevel=0):
+    def __init__(self, X, ntrees,  sample_size, limit=None, ExtensionLevel=0, random_state=None, n_jobs=None):
         """
         iForest(X, ntrees,  sample_size, limit=None, ExtensionLevel=0)
         Initialize a forest by passing in training data, number of trees to be used and the subsample size.
@@ -76,23 +77,50 @@ class iForest(object):
             The maximum allowed tree depth. This is by default set to average length of unsucessful search in a binary tree.
         ExtensionLevel : int
             Specifies degree of freedom in choosing the hyperplanes for dividing up data. Must be smaller than the dimension n of the dataset.
+        random_state: int
+            If int, random_state is the seed used by the random number generator
+        n_jobs: int or None, optional (default=None)
+            The number of jobs to run in parallel for both building the forest and computing paths
         """
 
         self.ntrees = ntrees
         self.X = X
         self.nobjs = len(X)
         self.sample = sample_size
-        self.Trees = []
+        
         self.limit = limit
         self.exlevel = ExtensionLevel
         self.CheckExtensionLevel()                                              # Extension Level check. See def for explanation.
         if limit is None:
             self.limit = int(np.ceil(np.log2(self.sample)))                     # Set limit to the default as specified by the paper (average depth of unsuccesful search through a binary tree).
         self.c = c_factor(self.sample)
-        for i in range(self.ntrees):                                            # This loop builds an ensemble of iTrees (the forest).
-            ix = rn.sample(range(self.nobjs), self.sample)
-            X_p = X[ix]
-            self.Trees.append(iTree(X_p, 0, self.limit, exlevel=self.exlevel))
+
+        if type(random_state) == int:
+            self.rng = np.random.RandomState(random_state)
+        elif type(random_state) == np.random.mtrand.RandomState:
+            self.rng = random_state
+        else:
+            self.rng = np.random
+
+        self.n_jobs = n_jobs
+
+        if n_jobs is None:
+            # Built the forest sequentially
+            self.Trees = []
+            for _ in range(self.ntrees):                                            # This loop builds an ensemble of iTrees (the forest).
+                self.Trees.append(self._build_tree(X))
+        else:
+            self.Trees = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(self._build_tree)(X) for _ in range(self.ntrees)
+            )
+
+    def _build_tree(self, X):
+        ix = list(range(self.nobjs))
+        self.rng.shuffle(ix)
+        ix = ix[:self.sample]
+        
+        X_p = X[ix]
+        return iTree(X_p, 0, self.limit, exlevel=self.exlevel, rng=self.rng)
 
     def CheckExtensionLevel(self):
         """
@@ -122,13 +150,20 @@ class iForest(object):
         if X_in is None:
             X_in = self.X
         S = np.zeros(len(X_in))
-        for i in  range(len(X_in)):
-            h_temp = 0
-            for j in range(self.ntrees):
-                h_temp += PathFactor(X_in[i],self.Trees[j]).path*1.0            # Compute path length for each point
-            Eh = h_temp/self.ntrees                                             # Average of path length travelled by the point in all trees.
-            S[i] = 2.0**(-Eh/self.c)                                            # Anomaly Score
+        if self.n_jobs is None:
+            for i in  range(len(X_in)):
+                self._compute_path(S, i)
+        else:
+            S = np.array(Parallel(n_jobs=self.n_jobs, prefer="threads")(delayed(self._compute_path)(X_in, i) for i in range(len(X_in))))
+
         return S
+    
+    def _compute_path(self, X_in, i):
+        h_temp = 0
+        for j in range(self.ntrees):
+            h_temp += PathFactor(X_in[i],self.Trees[j]).path*1.0            # Compute path length for each point
+        Eh = h_temp/self.ntrees                                             # Average of path length travelled by the point in all trees.
+        return 2.0**(-Eh/self.c)
 
 class Node(object):
     """
@@ -218,7 +253,7 @@ class iTree(object):
         Builds the tree recursively from a given node. Returns a Node object.
     """
 
-    def __init__(self,X,e,l, exlevel=0):
+    def __init__(self,X,e,l, exlevel=0, rng=None):
         """
         iTree(X, e, l, exlevel=0)
         Create a tree
@@ -233,6 +268,8 @@ class iTree(object):
             The maximum depth the tree can reach before its creation is terminated.
         exlevel : int
             Specifies degree of freedom in choosing the hyperplanes for dividing up data. Must be smaller than the dimension n of the dataset.
+        rng: RandomState of None(default=None)
+            A numpy random number generator. If None, the random number generator is the RandomState instance used by np.random
         """
         self.exlevel = exlevel
         self.e = e
@@ -244,7 +281,9 @@ class iTree(object):
         self.p = None                                                           # Intercept for the hyperplane for splitting data at a given node.
         self.n = None                                                           # Normal vector for the hyperplane for splitting data at a given node.
         self.exnodes = 0
+        self.rng = np.random if rng is None else rng
         self.root = self.make_tree(X,e,l)                                       # At each node create a new tree, starting with root node.
+        
 
     def make_tree(self,X,e,l):
         """
@@ -273,10 +312,10 @@ class iTree(object):
         else:                                                                   # Building the tree continues. All these nodes are internal.
             mins = X.min(axis=0)
             maxs = X.max(axis=0)
-            idxs = np.random.choice(range(self.dim), self.dim-self.exlevel-1, replace=False)  # Pick the indices for which the normal vector elements should be set to zero acccording to the extension level.
-            self.n = np.random.normal(0,1,self.dim)                             # A random normal vector picked form a uniform n-sphere. Note that in order to pick uniformly from n-sphere, we need to pick a random normal for each component of this vector.
+            idxs = self.rng.choice(range(self.dim), self.dim-self.exlevel-1, replace=False)  # Pick the indices for which the normal vector elements should be set to zero acccording to the extension level.
+            self.n = self.rng.normal(0,1,self.dim)                             # A random normal vector picked form a uniform n-sphere. Note that in order to pick uniformly from n-sphere, we need to pick a random normal for each component of this vector.
             self.n[idxs] = 0
-            self.p = np.random.uniform(mins,maxs)                               # Picking a random intercept point for the hyperplane splitting data.
+            self.p = self.rng.uniform(mins,maxs)                               # Picking a random intercept point for the hyperplane splitting data.
             w = (X-self.p).dot(self.n) < 0                                      # Criteria that determines if a data point should go to the left or right child node.
             return Node(X, self.n, self.p, e,\
             left=self.make_tree(X[w],e+1,l),\
